@@ -22,6 +22,7 @@ var (
 	listenPort = flag.Int("port", 9768, "Listening port number.")
 	logfmt     = flag.String("logfmt", "logfmt", "PromLogFormat[logfmt|json].")
 	loglevel   = flag.String("loglevel", "info", "PromLogLevel[debug, info, warn, error].")
+	timeout    = flag.Int("timeout", 30, "Maximum time (in seconds) to wait for passenger instance.")
 )
 
 func main() {
@@ -34,7 +35,11 @@ func main() {
 	c := passenger.Context{}
 	factory := passenger.CreateFactory(c)
 	server := factory.FindInstance()
-	for i := 0; i < 20; i++ {
+
+	// Calculate max retries based on timeout (each retry is 200ms)
+	maxRetries := (*timeout * 1000) / 200
+
+	for i := 0; i < maxRetries; i++ {
 		if server != nil {
 			break
 		}
@@ -42,26 +47,45 @@ func main() {
 		time.Sleep(time.Millisecond * 200)
 		server = factory.FindInstance()
 	}
-	if server == nil {
-		_ = level.Error(logger).Log(logging.Msg("passenger not found."))
-		return
-	}
-	_ = level.Info(logger).Log(logging.Msg("Found passenger instance."))
 
-	// Collector setup.
-	collector := metric.NewCollector(server, logger)
-	prometheus.MustRegister(collector)
+	var collector prometheus.Collector
+
+	if server == nil {
+		_ = level.Error(logger).Log(logging.Msg("passenger not found. will retry in /health and /metrics."))
+	} else {
+		_ = level.Info(logger).Log(logging.Msg("Found passenger instance."))
+		collector = metric.NewCollector(server, logger)
+		prometheus.MustRegister(collector)
+	}
+
 	_ = level.Info(logger).Log(logging.Msgf("Starting passenger-go-exporter[port %d]", *listenPort))
 
 	// HTTP Server setup.
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if server.IsEnabled() {
-			w.WriteHeader(http.StatusOK)
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
+		if server == nil || !server.IsEnabled() {
+			newServer := factory.FindInstance()
+			if newServer == nil || !newServer.IsEnabled() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			server = newServer
+			_ = level.Info(logger).Log(logging.Msg("Recovered passenger instance in /health."))
+
+			// Perlu hati-hati saat register ulang collector
+			collector = metric.NewCollector(server, logger)
+			err := prometheus.Register(collector)
+			if err != nil {
+				if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+					collector = are.ExistingCollector
+				} else {
+					_ = level.Error(logger).Log(logging.Msg("Failed to register collector after recovery."))
+				}
+			}
 		}
+		w.WriteHeader(http.StatusOK)
 	})
+
 	err := http.ListenAndServe(fmt.Sprintf(":%d", *listenPort), nil)
 	if err != nil {
 		_ = level.Error(logger).Log(logging.Err(&err))
